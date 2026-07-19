@@ -88,7 +88,11 @@ function buildScene(container, hooks) {
   let azimuth = 0.55, azVel = 0;
   let radius = 104, radiusTarget = 104;
   const R_MIN = 42, R_MAX = 155;
-  let interacted = false;
+  // <-- Change this to adjust how long (ms) the camera waits after the user's
+  // last drag/zoom before the slow passive idle rotation resumes.
+  const IDLE_RESUME_MS = 3000;
+  let lastInteractionAt = -Infinity; // -Infinity so idle drift is active before any input
+  const markInteraction = () => { lastInteractionAt = performance.now(); };
 
   function placeCamera() {
     const sp = Math.sin(POLAR), cp = Math.cos(POLAR);
@@ -546,7 +550,7 @@ function buildScene(container, hooks) {
 
   const el = renderer.domElement;
   const onPointerDown = (e) => {
-    dragging = true; interacted = true; movedPx = 0; lastX = e.clientX; lastY = e.clientY;
+    dragging = true; markInteraction(); movedPx = 0; lastX = e.clientX; lastY = e.clientY;
     el.style.cursor = "grabbing";
     el.setPointerCapture && el.setPointerCapture(e.pointerId);
   };
@@ -558,6 +562,7 @@ function buildScene(container, hooks) {
       movedPx += Math.abs(dx) + Math.abs(dy);
       azimuth -= dx * 0.0052;           // one axis only — pivot around the reference point
       azVel = -dx * 0.0052;
+      markInteraction();
     } else {
       setHighlight(raycastAt(e.clientX, e.clientY));
     }
@@ -573,7 +578,7 @@ function buildScene(container, hooks) {
   const onPointerLeave = () => { if (!dragging) setHighlight(null); };
   const onWheel = (e) => {
     e.preventDefault();
-    interacted = true;
+    markInteraction();
     radiusTarget = THREE.MathUtils.clamp(radiusTarget * (1 + e.deltaY * 0.0011), R_MIN, R_MAX);
   };
   el.addEventListener("pointerdown", onPointerDown);
@@ -605,7 +610,8 @@ function buildScene(container, hooks) {
 
     if (!dragging) {
       azimuth += azVel; azVel *= 0.92;                       // inertia
-      if (!interacted && !reduceMotion) azimuth += 0.0011;   // idle drift
+      const idleFor = performance.now() - lastInteractionAt;
+      if (!reduceMotion && idleFor > IDLE_RESUME_MS) azimuth += 0.0011; // idle drift, resumes after IDLE_RESUME_MS
     }
     radius += (radiusTarget - radius) * 0.1;
     placeCamera();
@@ -647,7 +653,7 @@ function buildScene(container, hooks) {
 
   return {
     setHighlight,
-    zoomBy(f) { interacted = true; radiusTarget = THREE.MathUtils.clamp(radiusTarget * f, R_MIN, R_MAX); },
+    zoomBy(f) { markInteraction(); radiusTarget = THREE.MathUtils.clamp(radiusTarget * f, R_MIN, R_MAX); },
     dispose() {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
@@ -850,6 +856,9 @@ function ContactPage({ onNav }) {
 
 const PAGES = { about: AboutPage, resume: ResumePage, projects: ProjectsPage, contact: ContactPage };
 
+// Must match the .ep-modal-out / .ep-modal-overlay.is-closing animation duration in CSS below.
+const MODAL_CLOSE_MS = 320;
+
 /* ============================================================
    App
    ============================================================ */
@@ -858,10 +867,13 @@ export default function App() {
   const apiRef = useRef(null);
   const tooltipRef = useRef(null);
   const pageRef = useRef(null);
+  const closeTimerRef = useRef(null);
   const [page, setPage] = useState(null);
+  const [closing, setClosing] = useState(false);
   const [hoverKey, setHoverKey] = useState(null);
 
   useEffect(() => { pageRef.current = page; }, [page]);
+  useEffect(() => () => clearTimeout(closeTimerRef.current), []);
 
   useEffect(() => {
     const api = buildScene(mountRef.current, {
@@ -879,11 +891,29 @@ export default function App() {
   }, []);
 
   const nav = useCallback((key) => {
-    setPage(key);
     setHoverKey(null);
     apiRef.current && apiRef.current.setHighlight(null);
-    window.scrollTo(0, 0);
+    if (key === null) {
+      // Keep the modal mounted while it plays its closing tween, then unmount.
+      setClosing(true);
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = setTimeout(() => {
+        setPage(null);
+        setClosing(false);
+      }, MODAL_CLOSE_MS);
+    } else {
+      clearTimeout(closeTimerRef.current);
+      setClosing(false);
+      setPage(key);
+    }
   }, []);
+
+  useEffect(() => {
+    if (!page) return;
+    const onKey = (e) => { if (e.key === "Escape") nav(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [page, nav]);
 
   const hoverWp = hoverKey && WAYPOINTS.find((w) => w.key === hoverKey);
   const Page = page ? PAGES[page] : null;
@@ -893,12 +923,14 @@ export default function App() {
       <style>{CSS}</style>
 
       {/* 3D expedition map */}
-      <div className={`ep-stage ${page ? "ep-hidden" : ""}`} aria-hidden={!!page}>
+      <div className={`ep-stage ${page ? "ep-stage-blurred" : ""}`} aria-hidden={!!page}>
         <div ref={mountRef} className="ep-canvas" />
 
         {/* Wordmark */}
         <div className="ep-brand">
-          <h1 className="ep-name">ERIC</h1>
+          <h1 className="ep-name">
+            <span className="ep-name">ERIC ZHANG</span>
+          </h1>
           <p className="ep-mono ep-tag">FINANCE · MARKETS · TORONTO — PORTFOLIO EXPEDITION</p>
         </div>
 
@@ -935,8 +967,18 @@ export default function App() {
         )}
       </div>
 
-      {/* Sub-pages */}
-      {Page && <Page onNav={nav} />}
+      {/* Sub-page modal: glass panel over the blurred mountain */}
+      {Page && (
+        <div
+          className={`ep-modal-overlay ${closing ? "is-closing" : ""}`}
+          onClick={(e) => { if (e.target === e.currentTarget) nav(null); }}
+        >
+          <div className={`ep-modal ${closing ? "is-closing" : ""}`} role="dialog" aria-modal="true">
+            <button className="ep-modal-close" aria-label="Close" onClick={() => nav(null)}>×</button>
+            <Page onNav={nav} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -965,14 +1007,16 @@ const CSS = `
 .ep-mono { font-family: var(--mono); letter-spacing: 0.12em; font-size: 0.68rem; }
 
 /* ---------- Stage ---------- */
-.ep-stage { position: fixed; inset: 0; overflow: hidden; }
-.ep-stage.ep-hidden { visibility: hidden; }
+.ep-stage { position: fixed; inset: 0; overflow: hidden; filter: blur(0px) brightness(1); transition: filter 0.4s ease; }
+.ep-stage.ep-stage-blurred { filter: blur(16px) brightness(0.55) saturate(1.15); pointer-events: none; }
 .ep-canvas, .ep-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
 .ep-brand { position: absolute; top: 2rem; left: 2rem; color: var(--glacier); pointer-events: none;
-  animation: ep-fade 0.9s ease both; }
-.ep-name { font-family: var(--display); font-weight: 700; font-size: clamp(2.6rem, 6vw, 4.6rem);
-  line-height: 0.95; letter-spacing: 0.02em; }
+  text-align: left; animation: ep-fade 0.9s ease both; }
+.ep-name { font-family: var(--display); font-weight: 700; letter-spacing: 0.02em;
+  line-height: 0.92; text-align: left; display: flex; flex-direction: column; }
+.ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); }
+.ep-name-last { color: var(--lantern); }
 .ep-tag { margin-top: 0.55rem; opacity: 0.75; }
 
 .ep-legend { position: absolute; left: 2rem; bottom: 2rem; display: flex; flex-direction: column;
@@ -1002,6 +1046,43 @@ const CSS = `
 .ep-tooltip strong { font-family: var(--display); font-size: 1.05rem; font-weight: 700; }
 .ep-tooltip em { font-style: normal; opacity: 0.6; font-size: 0.6rem; }
 
+/* ---------- Sub-page modal (glass morphism over the blurred mountain) ---------- */
+.ep-modal-overlay { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center;
+  justify-content: center; padding: clamp(1rem, 4vw, 3rem); background: rgba(6, 11, 20, 0.45);
+  animation: ep-overlay-in 0.38s ease both; }
+.ep-modal-overlay.is-closing { animation: ep-overlay-out 0.32s ease both; }
+
+.ep-modal { position: relative; width: min(920px, 100%); max-height: min(86vh, 920px);
+  overflow-y: auto; border-radius: 22px; background: rgba(18, 30, 48, 0.55);
+  border: 1px solid rgba(233, 241, 248, 0.18);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(26px) saturate(150%); -webkit-backdrop-filter: blur(26px) saturate(150%);
+  animation: ep-modal-in 0.38s cubic-bezier(.2, .9, .25, 1) both;
+  /* Re-theme the shared page/card/button styles to sit on dark glass instead of white paper.
+     color is set explicitly here (not just the --ink variable) because headings inherit the
+     computed color value, not the variable, so redefining --ink alone would not reach them. */
+  --paper: transparent; --ink: var(--glacier); --sub: rgba(233, 241, 248, 0.68);
+  --line: rgba(233, 241, 248, 0.18); --card-bg: rgba(233, 241, 248, 0.06); color: var(--ink); }
+.ep-modal.is-closing { animation: ep-modal-out 0.32s cubic-bezier(.4, 0, 1, 1) both; }
+
+.ep-modal .ep-page { background: transparent; min-height: 0; padding: clamp(1.4rem, 4vw, 2.4rem); animation: none; }
+.ep-modal .ep-contours { stroke: rgba(233, 241, 248, 0.18); }
+.ep-modal .ep-ph span { background: rgba(18, 30, 48, 0.85); }
+.ep-modal .ep-btn-outline { color: var(--glacier); border-color: rgba(233, 241, 248, 0.4); }
+.ep-modal .ep-btn-ghost { color: rgba(233, 241, 248, 0.7); }
+.ep-modal .ep-btn-ghost:hover { color: var(--glacier); border-color: var(--glacier); }
+
+.ep-modal-close { position: absolute; top: 1rem; right: 1rem; z-index: 1; width: 2.2rem; height: 2.2rem;
+  border-radius: 50%; border: 1px solid rgba(233, 241, 248, 0.25); background: rgba(10, 19, 34, 0.5);
+  color: var(--glacier); font-size: 1.3rem; line-height: 1; cursor: pointer; backdrop-filter: blur(6px); }
+.ep-modal-close:hover { border-color: var(--lantern); color: var(--lantern); }
+.ep-modal-close:focus-visible { outline: 2px solid var(--lantern); outline-offset: 2px; }
+
+@keyframes ep-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ep-overlay-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes ep-modal-in { from { opacity: 0; transform: translateY(48px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes ep-modal-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-40px) scale(0.98); } }
+
 /* ---------- Pages ---------- */
 .ep-page { position: relative; min-height: 100vh; background: var(--paper);
   padding: 1.6rem clamp(1.2rem, 6vw, 5rem) 3rem; animation: ep-rise 0.4s ease both; overflow: hidden; }
@@ -1028,7 +1109,7 @@ h3 { font-family: var(--display); font-size: 1.1rem; font-weight: 600; margin: 0
 .ep-row-between { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
 
 .ep-card { border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.3rem;
-  background: #fff; margin-bottom: 0.8rem; }
+  background: var(--card-bg, #fff); margin-bottom: 0.8rem; }
 .ep-project { display: flex; flex-direction: column; }
 .ep-project .ep-btn { align-self: flex-start; margin-top: auto; }
 
