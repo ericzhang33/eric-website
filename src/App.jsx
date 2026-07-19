@@ -91,8 +91,10 @@ function buildScene(container, hooks) {
   // <-- Change this to adjust how long (ms) the camera waits after the user's
   // last drag/zoom before the slow passive idle rotation resumes.
   const IDLE_RESUME_MS = 3000;
-  let lastInteractionAt = -Infinity; // -Infinity so idle drift is active before any input
+  let lastInteractionAt = -Infinity; // -Infinity so idle drift is ready to go once armed
   const markInteraction = () => { lastInteractionAt = performance.now(); };
+  // Gated by the loading screen: stays off until App calls setIdleEnabled(true).
+  let idleEnabled = false;
 
   function placeCamera() {
     const sp = Math.sin(POLAR), cp = Math.cos(POLAR);
@@ -611,7 +613,7 @@ function buildScene(container, hooks) {
     if (!dragging) {
       azimuth += azVel; azVel *= 0.92;                       // inertia
       const idleFor = performance.now() - lastInteractionAt;
-      if (!reduceMotion && idleFor > IDLE_RESUME_MS) azimuth += 0.0011; // idle drift, resumes after IDLE_RESUME_MS
+      if (!reduceMotion && idleEnabled && idleFor > IDLE_RESUME_MS) azimuth += 0.0011; // idle drift
     }
     radius += (radiusTarget - radius) * 0.1;
     placeCamera();
@@ -653,6 +655,7 @@ function buildScene(container, hooks) {
 
   return {
     setHighlight,
+    setIdleEnabled(v) { idleEnabled = v; },
     zoomBy(f) { markInteraction(); radiusTarget = THREE.MathUtils.clamp(radiusTarget * f, R_MIN, R_MAX); },
     dispose() {
       cancelAnimationFrame(raf);
@@ -859,6 +862,12 @@ const PAGES = { about: AboutPage, resume: ResumePage, projects: ProjectsPage, co
 // Must match the .ep-modal-out / .ep-modal-overlay.is-closing animation duration in CSS below.
 const MODAL_CLOSE_MS = 320;
 
+// Loading screen timing — also interpolated into the CSS animation durations below,
+// so JS and CSS can't drift out of sync.
+const LOADING_MS = 2200;         // minimum time the loader is shown
+const LOADER_FADE_MS = 500;      // loader fade-out duration once loading completes
+const ROTATE_LEAD_MS = 450;      // passive rotation arms this long before the loader finishes
+
 /* ============================================================
    App
    ============================================================ */
@@ -867,13 +876,40 @@ export default function App() {
   const apiRef = useRef(null);
   const tooltipRef = useRef(null);
   const pageRef = useRef(null);
+  const audioRef = useRef(null);
   const closeTimerRef = useRef(null);
   const [page, setPage] = useState(null);
   const [closing, setClosing] = useState(false);
   const [hoverKey, setHoverKey] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [showLoader, setShowLoader] = useState(true);
+  const [musicOn, setMusicOn] = useState(false);
 
   useEffect(() => { pageRef.current = page; }, [page]);
   useEffect(() => () => clearTimeout(closeTimerRef.current), []);
+
+  // Loading screen: hold passive rotation off until just before it finishes,
+  // then fade the loader out and let the rest of the site come alive.
+  useEffect(() => {
+    const rotateTimer = setTimeout(() => {
+      apiRef.current && apiRef.current.setIdleEnabled(true);
+    }, Math.max(0, LOADING_MS - ROTATE_LEAD_MS));
+    const doneTimer = setTimeout(() => setLoaded(true), LOADING_MS);
+    const unmountTimer = setTimeout(() => setShowLoader(false), LOADING_MS + LOADER_FADE_MS);
+    return () => { clearTimeout(rotateTimer); clearTimeout(doneTimer); clearTimeout(unmountTimer); };
+  }, []);
+
+  const toggleMusic = useCallback(() => {
+    if (!loaded) return;
+    setMusicOn((v) => !v);
+  }, [loaded]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (musicOn && loaded) audio.play().catch(() => {});
+    else audio.pause();
+  }, [musicOn, loaded]);
 
   useEffect(() => {
     const api = buildScene(mountRef.current, {
@@ -921,6 +957,39 @@ export default function App() {
   return (
     <div className="ep-root">
       <style>{CSS}</style>
+
+      {/* Loading screen */}
+      {showLoader && (
+        <div className={`ep-loader ${loaded ? "is-done" : ""}`} aria-hidden={loaded}>
+          <div className="ep-loader-inner">
+            <h1 className="ep-name">
+              <span className="ep-name-first">ERIC</span>
+              <span className="ep-name-last">ZHANG</span>
+            </h1>
+            <p className="ep-mono ep-loader-status">PREPARING THE ASCENT…</p>
+            <div className="ep-loader-bar"><div className="ep-loader-bar-fill" /></div>
+          </div>
+        </div>
+      )}
+
+      {/* Minimalist music player — drop a track at public/ambient.mp3 (or change the src below) to wire it up */}
+      <div className="ep-player">
+        <button
+          className={`ep-player-btn ${musicOn ? "is-playing" : ""}`}
+          onClick={toggleMusic}
+          disabled={!loaded}
+          aria-pressed={musicOn}
+          aria-label={musicOn ? "Pause music" : "Play music"}
+        >
+          {musicOn ? (
+            <span className="ep-player-bars"><span /><span /><span /></span>
+          ) : (
+            <span className="ep-player-play">▶</span>
+          )}
+        </button>
+        <span className="ep-mono ep-player-label">AMBIENT</span>
+        <audio ref={audioRef} loop preload="none" src="/ambient.mp3" />
+      </div>
 
       {/* 3D expedition map */}
       <div className={`ep-stage ${page ? "ep-stage-blurred" : ""}`} aria-hidden={!!page}>
@@ -1014,10 +1083,11 @@ const CSS = `
 
 .ep-brand { position: absolute; top: 2rem; left: 2rem; color: var(--glacier); pointer-events: none;
   text-align: left; animation: ep-fade 0.9s ease both; }
-.ep-name { font-family: var(--display); font-weight: 700; letter-spacing: 0.02em;
-  line-height: 0.92; text-align: left; display: flex; flex-direction: column; }
-.ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); }
-.ep-name-last { color: var(--lantern); }
+.ep-name { font-family: var(--display); letter-spacing: 0.02em; line-height: 0.92; text-align: left;
+  display: flex; flex-direction: row; align-items: baseline; flex-wrap: wrap; gap: 0.55rem; }
+.ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); color: var(--glacier); }
+.ep-name-first { font-weight: 700; }
+.ep-name-last { font-weight: 300; }
 .ep-tag { margin-top: 0.55rem; opacity: 0.75; }
 
 .ep-legend { position: absolute; left: 2rem; bottom: 2rem; display: flex; flex-direction: column;
@@ -1047,11 +1117,44 @@ const CSS = `
 .ep-tooltip strong { font-family: var(--display); font-size: 1.05rem; font-weight: 700; }
 .ep-tooltip em { font-style: normal; opacity: 0.6; font-size: 0.6rem; }
 
+/* ---------- Loading screen ---------- */
+.ep-loader { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center;
+  justify-content: center; background: var(--night); opacity: 1;
+  transition: opacity ${LOADER_FADE_MS}ms ease; }
+.ep-loader.is-done { opacity: 0; pointer-events: none; }
+.ep-loader-inner { display: flex; flex-direction: column; align-items: center; gap: 1.15rem; }
+.ep-loader-inner .ep-name { justify-content: center; }
+.ep-loader-status { color: var(--glacier); opacity: 0.55; }
+.ep-loader-bar { width: 220px; height: 3px; border-radius: 3px; background: rgba(233, 241, 248, 0.15); overflow: hidden; }
+.ep-loader-bar-fill { height: 100%; width: 0%; background: var(--lantern); border-radius: inherit;
+  animation: ep-load-fill ${LOADING_MS}ms cubic-bezier(.3, 0, .2, 1) forwards; }
+@keyframes ep-load-fill { from { width: 0%; } to { width: 100%; } }
+
+/* ---------- Music player ---------- */
+.ep-player { position: fixed; top: 2rem; right: 2rem; z-index: 40; display: flex;
+  align-items: center; gap: 0.6rem; animation: ep-fade 0.9s ease both; }
+.ep-player-btn { width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid rgba(233, 241, 248, 0.25);
+  background: rgba(10, 19, 34, 0.6); color: var(--glacier); cursor: pointer; backdrop-filter: blur(6px);
+  display: grid; place-items: center; transition: border-color .15s, opacity .15s; }
+.ep-player-btn:hover:not(:disabled) { border-color: var(--lantern); }
+.ep-player-btn:focus-visible { outline: 2px solid var(--lantern); outline-offset: 2px; }
+.ep-player-btn:disabled { opacity: 0.4; cursor: default; }
+.ep-player-btn.is-playing { border-color: var(--lantern); }
+.ep-player-play { font-size: 0.65rem; transform: translateX(1px); }
+.ep-player-bars { display: flex; align-items: flex-end; gap: 2px; height: 0.7rem; }
+.ep-player-bars span { width: 2.5px; background: var(--lantern); border-radius: 1px;
+  animation: ep-bars 0.8s ease-in-out infinite; }
+.ep-player-bars span:nth-child(1) { height: 40%; animation-delay: -0.4s; }
+.ep-player-bars span:nth-child(2) { height: 100%; animation-delay: -0.1s; }
+.ep-player-bars span:nth-child(3) { height: 65%; animation-delay: -0.6s; }
+@keyframes ep-bars { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(1); } }
+.ep-player-label { color: var(--glacier); opacity: 0.6; }
+
 /* ---------- Sub-page modal (glass morphism over the blurred mountain) ---------- */
 .ep-modal-overlay { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center;
   justify-content: center; padding: clamp(1rem, 4vw, 3rem); background: rgba(6, 11, 20, 0.45);
   animation: ep-overlay-in 0.38s ease both; }
-.ep-modal-overlay.is-closing { animation: ep-overlay-out 0.32s ease both; }
+.ep-modal-overlay.is-closing { animation: ep-overlay-out ${MODAL_CLOSE_MS}ms ease both; }
 
 .ep-modal { position: relative; width: min(920px, 100%); max-height: min(86vh, 920px);
   overflow-y: auto; border-radius: 22px; background: rgba(18, 30, 48, 0.55);
@@ -1064,7 +1167,7 @@ const CSS = `
      computed color value, not the variable, so redefining --ink alone would not reach them. */
   --paper: transparent; --ink: var(--glacier); --sub: rgba(233, 241, 248, 0.68);
   --line: rgba(233, 241, 248, 0.18); --card-bg: rgba(233, 241, 248, 0.06); color: var(--ink); }
-.ep-modal.is-closing { animation: ep-modal-out 0.32s cubic-bezier(.4, 0, 1, 1) both; }
+.ep-modal.is-closing { animation: ep-modal-out ${MODAL_CLOSE_MS}ms cubic-bezier(.4, 0, 1, 1) both; }
 
 .ep-modal .ep-page { background: transparent; min-height: 0; padding: clamp(1.4rem, 4vw, 2.4rem); animation: none; }
 .ep-modal .ep-contours { stroke: rgba(233, 241, 248, 0.18); }
@@ -1146,6 +1249,8 @@ h3 { font-family: var(--display); font-size: 1.1rem; font-weight: 600; margin: 0
   .ep-brand { top: 1.2rem; left: 1.2rem; }
   .ep-legend { left: 1.2rem; bottom: 4.4rem; }
   .ep-hint { display: none; }
+  .ep-player { top: 1.2rem; right: 1.2rem; }
+  .ep-player-label { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
