@@ -929,7 +929,8 @@ export default function App() {
         {/* Wordmark */}
         <div className="ep-brand">
           <h1 className="ep-name">
-            <span className="ep-name">ERIC ZHANG</span>
+            <span className="ep-name-first">ERIC</span>
+            <span className="ep-name-last">ZHANG</span>
           </h1>
           <p className="ep-mono ep-tag">FINANCE · MARKETS · TORONTO — PORTFOLIO EXPEDITION</p>
         </div>
