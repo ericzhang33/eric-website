@@ -1087,7 +1087,7 @@ const CSS = `
   display: flex; flex-direction: row; align-items: baseline; flex-wrap: wrap; gap: 0.55rem; }
 .ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); color: var(--glacier); }
 .ep-name-first { font-weight: 700; }
-.ep-name-last { font-weight: 300; }
+.ep-name-last { font-weight: 100; }
 .ep-tag { margin-top: 0.55rem; opacity: 0.75; }
 
 .ep-legend { position: absolute; left: 2rem; bottom: 2rem; display: flex; flex-direction: column;
