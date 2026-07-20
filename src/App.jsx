@@ -74,7 +74,8 @@ function buildScene(container, hooks) {
   const scene = new THREE.Scene();
   const NIGHT = 0x0a1322;
   scene.background = new THREE.Color(NIGHT);
-  scene.fog = new THREE.Fog(NIGHT, 130, 330);
+  // fog color matches the sky-dome horizon so distant terrain melts into the sky
+  scene.fog = new THREE.Fog(0x1b2c49, 130, 330);
 
   const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 900);
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -95,6 +96,12 @@ function buildScene(container, hooks) {
   const markInteraction = () => { lastInteractionAt = performance.now(); };
   // Gated by the loading screen: stays off until App calls setIdleEnabled(true).
   let idleEnabled = false;
+  // User settings (from the gear dropdown): passive rotation and snowfall.
+  let rotationEnabled = true;
+  let snowEnabled = true;
+  // Theme blend: 0 = night, 1 = sunset. themeMix eases toward themeTarget in the loop.
+  const THEME_FADE_S = 1.15;
+  let themeTarget = 0, themeMix = 0;
 
   function placeCamera() {
     const sp = Math.sin(POLAR), cp = Math.cos(POLAR);
@@ -106,14 +113,15 @@ function buildScene(container, hooks) {
     camera.lookAt(pivot);
   }
 
-  /* Lights */
-  scene.add(new THREE.HemisphereLight(0x2a3d5c, 0x090d14, 0.85));
-  const moonLight = new THREE.DirectionalLight(0xbfd4ef, 0.95);
-  moonLight.position.set(-90, 130, 110);
-  scene.add(moonLight);
-  const alpenglow = new THREE.DirectionalLight(0xf2a0b0, 0.38);
-  alpenglow.position.set(70, 60, -120);
-  scene.add(alpenglow);
+  /* Lights — all retinted when the theme blends between night and sunset */
+  const hemi = new THREE.HemisphereLight(0x2a3d5c, 0x090d14, 0.85);
+  scene.add(hemi);
+  const keyLight = new THREE.DirectionalLight(0xbfd4ef, 0.95);   // moon at night, low sun at sunset
+  keyLight.position.set(-90, 130, 110);
+  scene.add(keyLight);
+  const fillLight = new THREE.DirectionalLight(0xf2a0b0, 0.38);  // alpenglow at night, cool haze at sunset
+  fillLight.position.set(70, 60, -120);
+  scene.add(fillLight);
 
   /* Terrain */
   const SIZE = 150, SEG = 108;
@@ -154,32 +162,187 @@ function buildScene(container, hooks) {
   ));
 
   /* Valley floor to the horizon */
-  const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(900, 900),
-    new THREE.MeshStandardMaterial({ color: 0x0d1726, roughness: 1 })
-  );
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x0d1726, roughness: 1 });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(900, 900), floorMat);
   floor.rotation.x = -Math.PI / 2;
   floor.position.y = -0.25;
   scene.add(floor);
 
-  /* Stars + moon */
+  /* ---------- Sky: gradient dome, stars, moon/sun, clouds ---------- */
+  /* Two palettes; every sky/light parameter lerps between them (see applyTheme). */
+  const THEME = {
+    night: {
+      bg: 0x0a1322, fog: 0x1b2c49, fogNear: 130, fogFar: 330, floor: 0x0d1726,
+      hemiSky: 0x2a3d5c, hemiGround: 0x090d14, hemiI: 0.85,
+      key: 0xbfd4ef, keyI: 0.95, keyPos: new THREE.Vector3(-90, 130, 110),
+      fill: 0xf2a0b0, fillI: 0.38, fillPos: new THREE.Vector3(70, 60, -120),
+      horizon: 0x1b2c49, mid: 0x0d1930, zenith: 0x060c18,
+      cloud: 0x93a4bf, cloudGlow: 0x000000,
+    },
+    sunset: {
+      bg: 0xffb28a, fog: 0xffbe8c, fogNear: 85, fogFar: 250, floor: 0x7a5648,
+      hemiSky: 0xffb99a, hemiGround: 0x8a6258, hemiI: 0.9,
+      key: 0xff9d68, keyI: 0.85, keyPos: new THREE.Vector3(140, 38, -160),
+      fill: 0xc98bb8, fillI: 0.34, fillPos: new THREE.Vector3(-70, 55, 120),
+      horizon: 0xffbe8c, mid: 0xf9909e, zenith: 0xa583b4,
+      cloud: 0xffd9c4, cloudGlow: 0x572415,
+    },
+  };
+
+  /* Gradient sky dome (horizon → mid → zenith); vertex colors lerped on theme change */
+  const domeGeo = new THREE.SphereGeometry(470, 40, 24);
+  const domeNight = new Float32Array(domeGeo.attributes.position.count * 3);
+  const domeDay = new Float32Array(domeNight.length);
   {
-    const starPos = [];
-    for (let i = 0; i < 380; i++) {
-      const a = hash2(i, 7) * Math.PI * 2, e = 0.12 + hash2(i, 13) * 1.25, R = 430;
-      starPos.push(R * Math.cos(e) * Math.cos(a), 30 + R * Math.sin(e), R * Math.cos(e) * Math.sin(a));
+    const pos = domeGeo.attributes.position;
+    const cH = new THREE.Color(), cM = new THREE.Color(), cZ = new THREE.Color(), out = new THREE.Color();
+    const fillCols = (arr, th) => {
+      cH.setHex(th.horizon); cM.setHex(th.mid); cZ.setHex(th.zenith);
+      for (let i = 0; i < pos.count; i++) {
+        const h = Math.max(0, pos.getY(i) / 470);
+        if (h < 0.32) out.copy(cH).lerp(cM, smooth(h / 0.32));
+        else out.copy(cM).lerp(cZ, smooth((h - 0.32) / 0.68));
+        arr.set([out.r, out.g, out.b], i * 3);
+      }
+    };
+    fillCols(domeNight, THEME.night);
+    fillCols(domeDay, THEME.sunset);
+    domeGeo.setAttribute("color", new THREE.BufferAttribute(domeNight.slice(), 3));
+    const domeMesh = new THREE.Mesh(domeGeo, new THREE.MeshBasicMaterial({
+      vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false,
+    }));
+    domeMesh.renderOrder = -2;
+    scene.add(domeMesh);
+  }
+
+  /* Star field: base layer + a few brighter stars + a faint milky-way band */
+  function makeStars(count, seedA, seedB, size, color, opacity) {
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      const a = hash2(i, seedA) * Math.PI * 2, e = 0.1 + hash2(i, seedB) * 1.3, R = 430;
+      arr.push(R * Math.cos(e) * Math.cos(a), 26 + R * Math.sin(e), R * Math.cos(e) * Math.sin(a));
     }
     const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute(starPos, 3));
-    scene.add(new THREE.Points(g, new THREE.PointsMaterial({
-      color: 0xdfe9f5, size: 1.7, sizeAttenuation: false, fog: false, transparent: true, opacity: 0.9
-    })));
-    const moon = new THREE.Mesh(
-      new THREE.SphereGeometry(9, 20, 20),
-      new THREE.MeshBasicMaterial({ color: 0xe8f0fa, fog: false })
-    );
-    moon.position.set(-190, 150, 230);
-    scene.add(moon);
+    g.setAttribute("position", new THREE.Float32BufferAttribute(arr, 3));
+    const m = new THREE.PointsMaterial({
+      color, size, sizeAttenuation: false, fog: false, transparent: true, opacity, depthWrite: false,
+    });
+    scene.add(new THREE.Points(g, m));
+    return { m, base: opacity };
+  }
+  const starsFar = makeStars(380, 7, 13, 1.7, 0xdfe9f5, 0.9);
+  const starsBright = makeStars(90, 57, 71, 2.6, 0xfff3d9, 0.95);
+  const starsBand = (() => {
+    const nrm = new THREE.Vector3(0.42, 0.62, 0.66).normalize();
+    const u = new THREE.Vector3(1, 0, 0).cross(nrm).normalize();
+    const v = new THREE.Vector3().crossVectors(nrm, u);
+    const arr = [], p = new THREE.Vector3();
+    for (let i = 0; i < 260; i++) {
+      const a = hash2(i, 313) * Math.PI * 2;
+      const off = (hash2(i, 419) + hash2(i, 523) - 1) * 0.24;
+      p.copy(u).multiplyScalar(Math.cos(a)).addScaledVector(v, Math.sin(a))
+        .addScaledVector(nrm, off).normalize().multiplyScalar(432);
+      if (p.y < 12) continue;
+      arr.push(p.x, p.y + 18, p.z);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(arr, 3));
+    const m = new THREE.PointsMaterial({
+      color: 0xcfdcee, size: 1.1, sizeAttenuation: false, fog: false,
+      transparent: true, opacity: 0.5, depthWrite: false,
+    });
+    scene.add(new THREE.Points(g, m));
+    return { m, base: 0.5 };
+  })();
+
+  /* Moon (night) and low sun (sunset) crossfade */
+  const moonMat = new THREE.MeshBasicMaterial({ color: 0xe8f0fa, fog: false, transparent: true });
+  const moon = new THREE.Mesh(new THREE.SphereGeometry(9, 20, 20), moonMat);
+  moon.position.set(-190, 150, 230);
+  const moonHaloMat = new THREE.MeshBasicMaterial({
+    color: 0xbfd2ea, fog: false, transparent: true, opacity: 0.14, depthWrite: false,
+  });
+  const moonHalo = new THREE.Mesh(new THREE.SphereGeometry(13.5, 20, 20), moonHaloMat);
+  moonHalo.position.copy(moon.position);
+  moonHalo.renderOrder = 1;
+  const sunMat = new THREE.MeshBasicMaterial({ color: 0xffdfa3, fog: false, transparent: true, opacity: 0 });
+  const sun = new THREE.Mesh(new THREE.SphereGeometry(15, 24, 24), sunMat);
+  sun.position.set(272, 74, -312); // matches the sunset key-light direction
+  const sunGlowMat = new THREE.MeshBasicMaterial({
+    color: 0xffb26e, fog: false, transparent: true, opacity: 0, depthWrite: false,
+  });
+  const sunGlow = new THREE.Mesh(new THREE.SphereGeometry(34, 24, 24), sunGlowMat);
+  sunGlow.position.copy(sun.position);
+  sunGlow.renderOrder = 1;
+  // wide, very faint outer flare around the sun — kept subtle
+  const sunFlareMat = new THREE.MeshBasicMaterial({
+    color: 0xffcfa8, fog: false, transparent: true, opacity: 0, depthWrite: false,
+  });
+  const sunFlare = new THREE.Mesh(new THREE.SphereGeometry(80, 24, 24), sunFlareMat);
+  sunFlare.position.copy(sun.position);
+  sunFlare.renderOrder = 1;
+  scene.add(moon, moonHalo, sun, sunGlow, sunFlare);
+
+  /* A few low-poly clouds drifting far out; they pick up the theme lighting */
+  const cloudMat = new THREE.MeshStandardMaterial({
+    color: 0x93a4bf, flatShading: true, roughness: 1, transparent: true, opacity: 0.92,
+  });
+  const clouds = new THREE.Group();
+  for (let i = 0; i < 6; i++) {
+    const cl = new THREE.Group();
+    const puffs = 3 + Math.floor(hash2(i, 611) * 3);
+    for (let k = 0; k < puffs; k++) {
+      const s = new THREE.Mesh(new THREE.IcosahedronGeometry(4 + hash2(i * 7 + k, 727) * 3.5, 0), cloudMat);
+      s.position.set(
+        k * 5.2 - puffs * 2.6 + (hash2(i + k, 811) - 0.5) * 3,
+        (hash2(i + k, 907) - 0.5) * 2.2,
+        (hash2(i + k, 1013) - 0.5) * 4
+      );
+      s.scale.y = 0.4 + hash2(i + k, 1117) * 0.14;
+      cl.add(s);
+    }
+    const a = (i / 6) * Math.PI * 2 + hash2(i, 1201) * 0.8;
+    const r = 200 + hash2(i, 1301) * 70; // outside the camera's orbit so none loom into view
+    cl.position.set(Math.cos(a) * r, 70 + hash2(i, 1409) * 24, Math.sin(a) * r);
+    clouds.add(cl);
+  }
+  scene.add(clouds);
+
+  /* Blend every sky/light parameter between the two themes */
+  const _ca = new THREE.Color(), _cb = new THREE.Color();
+  const mixHex = (target, hexA, hexB, k) => target.copy(_ca.setHex(hexA)).lerp(_cb.setHex(hexB), k);
+  function applyTheme(raw) {
+    const k = smooth(THREE.MathUtils.clamp(raw, 0, 1));
+    const N = THEME.night, D = THEME.sunset;
+    mixHex(scene.background, N.bg, D.bg, k);
+    mixHex(scene.fog.color, N.fog, D.fog, k);
+    scene.fog.near = THREE.MathUtils.lerp(N.fogNear, D.fogNear, k);
+    scene.fog.far = THREE.MathUtils.lerp(N.fogFar, D.fogFar, k);
+    mixHex(floorMat.color, N.floor, D.floor, k);
+    mixHex(hemi.color, N.hemiSky, D.hemiSky, k);
+    mixHex(hemi.groundColor, N.hemiGround, D.hemiGround, k);
+    hemi.intensity = THREE.MathUtils.lerp(N.hemiI, D.hemiI, k);
+    mixHex(keyLight.color, N.key, D.key, k);
+    keyLight.intensity = THREE.MathUtils.lerp(N.keyI, D.keyI, k);
+    keyLight.position.lerpVectors(N.keyPos, D.keyPos, k);
+    mixHex(fillLight.color, N.fill, D.fill, k);
+    fillLight.intensity = THREE.MathUtils.lerp(N.fillI, D.fillI, k);
+    fillLight.position.lerpVectors(N.fillPos, D.fillPos, k);
+    const night = 1 - k;
+    starsFar.m.opacity = starsFar.base * night;
+    starsBright.m.opacity = starsBright.base * night;
+    starsBand.m.opacity = starsBand.base * night;
+    moonMat.opacity = night;
+    moonHaloMat.opacity = 0.14 * night;
+    sunMat.opacity = k;
+    sunGlowMat.opacity = 0.28 * k;
+    sunFlareMat.opacity = 0.1 * k;
+    mixHex(cloudMat.color, N.cloud, D.cloud, k);
+    mixHex(cloudMat.emissive, N.cloudGlow, D.cloudGlow, k);
+    outlineMats.forEach((om) => mixHex(om.color, 0xffb454, 0x2f6fbf, k));
+    const dc = domeGeo.attributes.color;
+    for (let i = 0; i < dc.array.length; i++) dc.array[i] = domeNight[i] + (domeDay[i] - domeNight[i]) * k;
+    dc.needsUpdate = true;
   }
 
   /* Falling snow */
@@ -223,6 +386,7 @@ function buildScene(container, hooks) {
   /* ---------- Waypoint structures (clickable hotspots) ---------- */
   const LANTERN = 0xffb454;
   const pickMeshes = [];
+  const outlineMats = []; // hover-outline materials, retinted gold → blue by applyTheme
   const hotspots = {}; // key -> { group, outline, anchor }
   const anims = [];    // per-frame animation callbacks (smoke, fire flicker...)
 
@@ -239,7 +403,9 @@ function buildScene(container, hooks) {
     meshes.forEach((o) => {
       if (!o.userData.noPick) { o.userData.hotspotKey = key; pickMeshes.push(o); }
       if (o.userData.noOutline) return;
-      const m = new THREE.Mesh(o.geometry, new THREE.MeshBasicMaterial({ color: LANTERN, side: THREE.BackSide }));
+      const oMat = new THREE.MeshBasicMaterial({ color: LANTERN, side: THREE.BackSide });
+      outlineMats.push(oMat);
+      const m = new THREE.Mesh(o.geometry, oMat);
       rel.multiplyMatrices(inv, o.matrixWorld);
       rel.decompose(m.position, m.quaternion, m.scale);
       m.scale.multiplyScalar(1.13);
@@ -605,15 +771,24 @@ function buildScene(container, hooks) {
   const anchorV = new THREE.Vector3();
   let raf = 0;
   const clock = new THREE.Clock();
+  let lastT = 0;
   function loop() {
     raf = requestAnimationFrame(loop);
     if (hooks.isPaused()) return;
     const t = clock.getElapsedTime();
+    const dt = Math.min(t - lastT, 0.1); lastT = t;
+
+    // ease the sky and lighting between night and sunset
+    if (themeMix !== themeTarget) {
+      const step = reduceMotion ? 1 : dt / THEME_FADE_S;
+      themeMix += THREE.MathUtils.clamp(themeTarget - themeMix, -step, step);
+      applyTheme(themeMix);
+    }
 
     if (!dragging) {
       azimuth += azVel; azVel *= 0.92;                       // inertia
       const idleFor = performance.now() - lastInteractionAt;
-      if (!reduceMotion && idleEnabled && idleFor > IDLE_RESUME_MS) azimuth += 0.0011; // idle drift
+      if (!reduceMotion && idleEnabled && rotationEnabled && idleFor > IDLE_RESUME_MS) azimuth += 0.0011; // idle drift
     }
     radius += (radiusTarget - radius) * 0.1;
     placeCamera();
@@ -633,9 +808,13 @@ function buildScene(container, hooks) {
     if (!reduceMotion) {
       climber.userData.lamp.intensity = 0.6 + 0.18 * Math.sin(t * 2.4);
       anims.forEach((f) => f(t)); // chimney smoke, campfire flicker...
+      clouds.rotation.y = t * 0.0045;              // slow cloud drift
+      const nightF = 1 - smooth(themeMix);         // stars twinkle, fade out at sunset
+      starsFar.m.opacity = starsFar.base * (0.86 + 0.14 * Math.sin(t * 0.8)) * nightF;
+      starsBright.m.opacity = starsBright.base * (0.84 + 0.16 * Math.sin(t * 1.27 + 2.1)) * nightF;
     }
     // snowfall
-    if (snowPts) {
+    if (snowPts && snowEnabled) {
       for (let i = 0; i < snowArr.length; i += 3) {
         snowArr[i + 1] -= 0.055 + (i % 7) * 0.004;
         snowArr[i] += Math.sin(t + i) * 0.006;
@@ -656,6 +835,9 @@ function buildScene(container, hooks) {
   return {
     setHighlight,
     setIdleEnabled(v) { idleEnabled = v; },
+    setRotationEnabled(v) { rotationEnabled = v; },
+    setSnowEnabled(v) { snowEnabled = v; if (snowPts) snowPts.visible = v; },
+    setDayMode(v) { themeTarget = v ? 1 : 0; },
     zoomBy(f) { markInteraction(); radiusTarget = THREE.MathUtils.clamp(radiusTarget * f, R_MIN, R_MAX); },
     dispose() {
       cancelAnimationFrame(raf);
@@ -691,6 +873,20 @@ const StubButton = ({ children, hint, variant = "ep-btn-primary" }) => {
     </span>
   );
 };
+
+/* Toggle row inside the settings dropdown */
+const SettingRow = ({ label, on, onToggle, disabled }) => (
+  <button
+    className={`ep-set-row ${on ? "is-on" : ""}`}
+    role="switch"
+    aria-checked={on}
+    disabled={disabled}
+    onClick={onToggle}
+  >
+    <span className="ep-set-label">{label}</span>
+    <span className="ep-set-switch" aria-hidden="true"><span className="ep-set-knob" /></span>
+  </button>
+);
 
 const Contours = () => (
   <svg className="ep-contours" viewBox="0 0 300 300" aria-hidden="true">
@@ -884,6 +1080,10 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [showLoader, setShowLoader] = useState(true);
   const [musicOn, setMusicOn] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dayMode, setDayMode] = useState(false);
+  const [rotationOn, setRotationOn] = useState(true);
+  const [snowOn, setSnowOn] = useState(true);
 
   useEffect(() => { pageRef.current = page; }, [page]);
   useEffect(() => () => clearTimeout(closeTimerRef.current), []);
@@ -926,7 +1126,28 @@ export default function App() {
     return () => api.dispose();
   }, []);
 
+  // Push the dropdown settings into the 3D scene
+  useEffect(() => { apiRef.current && apiRef.current.setDayMode(dayMode); }, [dayMode]);
+  useEffect(() => { apiRef.current && apiRef.current.setRotationEnabled(rotationOn); }, [rotationOn]);
+  useEffect(() => { apiRef.current && apiRef.current.setSnowEnabled(snowOn); }, [snowOn]);
+
+  // Settings dropdown: close on any outside interaction (canvas, waypoints...) or Escape
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onDown = (e) => {
+      if (!(e.target instanceof Element) || !e.target.closest(".ep-settings")) setSettingsOpen(false);
+    };
+    const onKey = (e) => { if (e.key === "Escape") setSettingsOpen(false); };
+    document.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [settingsOpen]);
+
   const nav = useCallback((key) => {
+    setSettingsOpen(false);
     setHoverKey(null);
     apiRef.current && apiRef.current.setHighlight(null);
     if (key === null) {
@@ -955,7 +1176,7 @@ export default function App() {
   const Page = page ? PAGES[page] : null;
 
   return (
-    <div className="ep-root">
+    <div className={`ep-root ${dayMode ? "ep-day" : ""}`}>
       <style>{CSS}</style>
 
       {/* Loading screen */}
@@ -972,22 +1193,35 @@ export default function App() {
         </div>
       )}
 
-      {/* Minimalist music player — drop a track at public/ambient.mp3 (or change the src below) to wire it up */}
-      <div className="ep-player">
+      {/* Settings dropdown (top-right): music, sunset mode, rotation, snowfall.
+          Music: drop a track at public/ambient.mp3 (or change the src below) to wire it up. */}
+      <div className="ep-settings">
         <button
-          className={`ep-player-btn ${musicOn ? "is-playing" : ""}`}
-          onClick={toggleMusic}
-          disabled={!loaded}
-          aria-pressed={musicOn}
-          aria-label={musicOn ? "Pause music" : "Play music"}
+          className={`ep-set-btn ${settingsOpen ? "is-open" : ""}`}
+          onClick={() => setSettingsOpen((v) => !v)}
+          aria-expanded={settingsOpen}
+          aria-label="Settings"
         >
-          {musicOn ? (
-            <span className="ep-player-bars"><span /><span /><span /></span>
-          ) : (
-            <span className="ep-player-play">▶</span>
-          )}
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <g stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <line x1="2" y1="4" x2="14" y2="4" />
+              <line x1="2" y1="8" x2="14" y2="8" />
+              <line x1="2" y1="12" x2="14" y2="12" />
+            </g>
+            <g fill="currentColor" stroke="none">
+              <circle cx="10.2" cy="4" r="2" />
+              <circle cx="5.2" cy="8" r="2" />
+              <circle cx="11.4" cy="12" r="2" />
+            </g>
+          </svg>
         </button>
-        <span className="ep-mono ep-player-label">AMBIENT</span>
+        <div className={`ep-set-panel ${settingsOpen ? "is-open" : ""}`} role="group" aria-label="Settings" aria-hidden={!settingsOpen}>
+          <p className="ep-mono ep-set-title">SETTINGS</p>
+          <SettingRow label="Music" on={musicOn} disabled={!loaded} onToggle={toggleMusic} />
+          <SettingRow label="Sunset mode" on={dayMode} onToggle={() => setDayMode((v) => !v)} />
+          <SettingRow label="Rotation" on={rotationOn} onToggle={() => setRotationOn((v) => !v)} />
+          <SettingRow label="Snowfall" on={snowOn} onToggle={() => setSnowOn((v) => !v)} />
+        </div>
         <audio ref={audioRef} loop preload="none" src="/ambient.mp3" />
       </div>
 
@@ -1073,7 +1307,19 @@ const CSS = `
   --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-.ep-root { font-family: var(--body); color: var(--ink); min-height: 100vh; background: var(--night); }
+.ep-root { font-family: var(--body); color: var(--ink); min-height: 100vh; background: var(--night);
+  /* Overlay (on-stage) UI palette — flipped by .ep-day in sunset mode */
+  --ui-text: var(--glacier);
+  --ui-panel: rgba(10, 19, 34, 0.55);
+  --ui-panel-strong: rgba(10, 19, 34, 0.78);
+  --ui-border: rgba(233, 241, 248, 0.16);
+  --ui-accent: var(--lantern); }
+.ep-root.ep-day {
+  --ui-text: #253140;
+  --ui-panel: rgba(255, 250, 243, 0.55);
+  --ui-panel-strong: rgba(255, 250, 243, 0.82);
+  --ui-border: rgba(37, 49, 64, 0.22);
+  --ui-accent: #2f6fbf; }
 .ep-mono { font-family: var(--mono); letter-spacing: 0.12em; font-size: 0.68rem; }
 
 /* ---------- Stage ---------- */
@@ -1081,11 +1327,12 @@ const CSS = `
 .ep-stage.ep-stage-blurred { filter: blur(16px) brightness(0.55) saturate(1.15); pointer-events: none; }
 .ep-canvas, .ep-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
-.ep-brand { position: absolute; top: 2rem; left: 2rem; color: var(--glacier); pointer-events: none;
-  text-align: left; animation: ep-fade 0.9s ease both; }
+.ep-brand { position: absolute; top: 2rem; left: 2rem; color: var(--ui-text); pointer-events: none;
+  text-align: left; animation: ep-fade 0.9s ease both; transition: color .6s ease; }
 .ep-name { font-family: var(--display); letter-spacing: 0.02em; line-height: 0.92; text-align: left;
   display: flex; flex-direction: row; align-items: baseline; flex-wrap: wrap; gap: 0.55rem; }
-.ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); color: var(--glacier); }
+.ep-name-first, .ep-name-last { font-size: clamp(2.6rem, 6vw, 4.6rem); color: var(--ui-text);
+  transition: color .6s ease; }
 .ep-name-first { font-weight: 700; }
 .ep-name-last { font-weight: 100; }
 .ep-tag { margin-top: 0.55rem; opacity: 0.75; }
@@ -1093,27 +1340,31 @@ const CSS = `
 .ep-legend { position: absolute; left: 2rem; bottom: 2rem; display: flex; flex-direction: column;
   gap: 0.4rem; animation: ep-fade 0.9s 0.15s ease both; }
 .ep-legend-item { display: flex; flex-direction: column; align-items: flex-start; gap: 0.12rem;
-  background: rgba(10, 19, 34, 0.55); border: 1px solid rgba(233, 241, 248, 0.16);
-  color: var(--glacier); padding: 0.5rem 0.8rem; border-radius: 10px; cursor: pointer;
-  backdrop-filter: blur(6px); text-align: left; transition: border-color .15s, transform .15s; }
+  background: var(--ui-panel); border: 1px solid var(--ui-border);
+  color: var(--ui-text); padding: 0.5rem 0.8rem; border-radius: 10px; cursor: pointer;
+  backdrop-filter: blur(6px); text-align: left;
+  transition: border-color .15s, transform .15s, background-color .6s ease, color .6s ease; }
 .ep-legend-item .ep-mono { opacity: 0.6; }
 .ep-legend-item strong { font-family: var(--display); font-size: 0.95rem; font-weight: 600; }
-.ep-legend-item:hover, .ep-legend-item.is-hot { border-color: var(--lantern); transform: translateX(3px); }
-.ep-legend-item:focus-visible { outline: 2px solid var(--lantern); outline-offset: 2px; }
+.ep-legend-item:hover, .ep-legend-item.is-hot { border-color: var(--ui-accent); transform: translateX(3px); }
+.ep-legend-item:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
 
+/* the hint sits over dark terrain in both themes, so it stays light with a soft halo */
 .ep-hint { position: absolute; bottom: 1.4rem; left: 50%; transform: translateX(-50%);
-  color: var(--glacier); opacity: 0.55; pointer-events: none; white-space: nowrap; }
+  color: var(--glacier); opacity: 0.6; pointer-events: none; white-space: nowrap;
+  text-shadow: 0 1px 6px rgba(8, 12, 20, 0.5); }
 .ep-zoom { position: absolute; right: 1.6rem; bottom: 1.6rem; display: flex; flex-direction: column; gap: 0.4rem; }
-.ep-zoom button { width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid rgba(233,241,248,0.25);
-  background: rgba(10,19,34,0.6); color: var(--glacier); font-size: 1.15rem; cursor: pointer; backdrop-filter: blur(6px); }
-.ep-zoom button:hover { border-color: var(--lantern); }
-.ep-zoom button:focus-visible { outline: 2px solid var(--lantern); }
+.ep-zoom button { width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid var(--ui-border);
+  background: var(--ui-panel); color: var(--ui-text); font-size: 1.15rem; cursor: pointer; backdrop-filter: blur(6px);
+  transition: border-color .15s, background-color .6s ease, color .6s ease; }
+.ep-zoom button:hover { border-color: var(--ui-accent); }
+.ep-zoom button:focus-visible { outline: 2px solid var(--ui-accent); }
 
 .ep-tooltip { position: absolute; top: 0; left: 0; pointer-events: none; display: flex;
   flex-direction: column; gap: 0.15rem; padding: 0.6rem 0.85rem; border-radius: 10px;
-  background: rgba(10, 19, 34, 0.82); border: 1px solid var(--lantern);
-  color: var(--glacier); box-shadow: 0 8px 28px rgba(0,0,0,0.45); animation: ep-pop 0.16s ease both; }
-.ep-tooltip .ep-mono { color: var(--lantern); }
+  background: var(--ui-panel-strong); border: 1px solid var(--ui-accent);
+  color: var(--ui-text); box-shadow: 0 8px 28px rgba(0,0,0,0.45); animation: ep-pop 0.16s ease both; }
+.ep-tooltip .ep-mono { color: var(--ui-accent); }
 .ep-tooltip strong { font-family: var(--display); font-size: 1.05rem; font-weight: 700; }
 .ep-tooltip em { font-style: normal; opacity: 0.6; font-size: 0.6rem; }
 
@@ -1130,25 +1381,40 @@ const CSS = `
   animation: ep-load-fill ${LOADING_MS}ms cubic-bezier(.3, 0, .2, 1) forwards; }
 @keyframes ep-load-fill { from { width: 0%; } to { width: 100%; } }
 
-/* ---------- Music player ---------- */
-.ep-player { position: fixed; top: 2rem; right: 2rem; z-index: 40; display: flex;
-  align-items: center; gap: 0.6rem; animation: ep-fade 0.9s ease both; }
-.ep-player-btn { width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid rgba(233, 241, 248, 0.25);
-  background: rgba(10, 19, 34, 0.6); color: var(--glacier); cursor: pointer; backdrop-filter: blur(6px);
-  display: grid; place-items: center; transition: border-color .15s, opacity .15s; }
-.ep-player-btn:hover:not(:disabled) { border-color: var(--lantern); }
-.ep-player-btn:focus-visible { outline: 2px solid var(--lantern); outline-offset: 2px; }
-.ep-player-btn:disabled { opacity: 0.4; cursor: default; }
-.ep-player-btn.is-playing { border-color: var(--lantern); }
-.ep-player-play { font-size: 0.65rem; transform: translateX(1px); }
-.ep-player-bars { display: flex; align-items: flex-end; gap: 2px; height: 0.7rem; }
-.ep-player-bars span { width: 2.5px; background: var(--lantern); border-radius: 1px;
-  animation: ep-bars 0.8s ease-in-out infinite; }
-.ep-player-bars span:nth-child(1) { height: 40%; animation-delay: -0.4s; }
-.ep-player-bars span:nth-child(2) { height: 100%; animation-delay: -0.1s; }
-.ep-player-bars span:nth-child(3) { height: 65%; animation-delay: -0.6s; }
-@keyframes ep-bars { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(1); } }
-.ep-player-label { color: var(--glacier); opacity: 0.6; }
+/* ---------- Settings dropdown (top-right) ---------- */
+.ep-settings { position: fixed; top: 2rem; right: 2rem; z-index: 25; display: flex;
+  flex-direction: column; align-items: flex-end; animation: ep-fade 0.9s ease both; }
+.ep-set-btn { width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid var(--ui-border);
+  background: var(--ui-panel); color: var(--ui-text); cursor: pointer; backdrop-filter: blur(6px);
+  display: grid; place-items: center;
+  transition: border-color .15s, transform .25s ease, background-color .6s ease, color .6s ease; }
+.ep-set-btn:hover, .ep-set-btn.is-open { border-color: var(--ui-accent); }
+.ep-set-btn.is-open { transform: rotate(90deg); }
+.ep-set-btn:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.ep-set-panel { position: absolute; top: 3.1rem; right: 0; width: 13.5rem;
+  padding: 0.8rem 0.9rem 0.4rem; border-radius: 14px; border: 1px solid var(--ui-border);
+  background: var(--ui-panel-strong); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+  opacity: 0; transform: translateY(-8px) scale(0.97); transform-origin: top right; pointer-events: none;
+  transition: opacity .24s ease, transform .24s cubic-bezier(.2, .9, .3, 1),
+    background-color .6s ease, border-color .6s ease; }
+.ep-set-panel.is-open { opacity: 1; transform: none; pointer-events: auto; }
+.ep-set-title { color: var(--ui-text); opacity: 0.55; margin-bottom: 0.35rem; transition: color .6s ease; }
+.ep-set-row { width: 100%; display: flex; align-items: center; justify-content: space-between;
+  gap: 0.8rem; background: none; border: none; border-top: 1px solid var(--ui-border);
+  padding: 0.55rem 0.1rem; cursor: pointer; color: var(--ui-text);
+  transition: color .6s ease, border-color .6s ease; }
+.ep-set-row:nth-of-type(1) { border-top: none; }
+.ep-set-row:disabled { opacity: 0.45; cursor: default; }
+.ep-set-row:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; border-radius: 8px; }
+.ep-set-label { font-family: var(--body); font-size: 0.82rem; font-weight: 500; }
+.ep-set-switch { position: relative; flex: none; width: 2.05rem; height: 1.15rem; border-radius: 999px;
+  background: var(--ui-border); transition: background-color .2s ease; }
+.ep-set-knob { position: absolute; top: 0.14rem; left: 0.14rem; width: 0.87rem; height: 0.87rem;
+  border-radius: 50%; background: var(--ui-text);
+  transition: transform .22s cubic-bezier(.3, .9, .4, 1.2), background-color .6s ease; }
+.ep-set-row.is-on .ep-set-switch { background: var(--ui-accent); }
+.ep-set-row.is-on .ep-set-knob { transform: translateX(0.9rem); background: #fff; }
 
 /* ---------- Sub-page modal (glass morphism over the blurred mountain) ---------- */
 .ep-modal-overlay { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center;
@@ -1181,6 +1447,26 @@ const CSS = `
   color: var(--glacier); font-size: 1.3rem; line-height: 1; cursor: pointer; backdrop-filter: blur(6px); }
 .ep-modal-close:hover { border-color: var(--lantern); color: var(--lantern); }
 .ep-modal-close:focus-visible { outline: 2px solid var(--lantern); outline-offset: 2px; }
+
+/* Sunset (light) mode: pages go white, accent shifts orange → blue */
+.ep-day .ep-modal-overlay { background: rgba(94, 63, 38, 0.3); }
+.ep-day .ep-modal { background: rgba(255, 252, 247, 0.82); border-color: rgba(37, 49, 64, 0.15);
+  box-shadow: 0 30px 90px rgba(74, 46, 22, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --ink: #1c2733; --sub: #5c6b7c; --line: #d9dee6; --card-bg: rgba(255, 255, 255, 0.75);
+  --accent: #2f6fbf; }
+.ep-day .ep-modal .ep-contours { stroke: rgba(28, 39, 51, 0.16); }
+.ep-day .ep-modal .ep-ph span { background: rgba(255, 255, 255, 0.9); }
+.ep-day .ep-modal .ep-btn-outline { color: var(--ink); border-color: rgba(28, 39, 51, 0.45); }
+.ep-day .ep-modal .ep-btn-ghost { color: var(--sub); }
+.ep-day .ep-modal .ep-btn-ghost:hover { color: var(--ink); border-color: var(--ink); }
+.ep-day .ep-modal .ep-btn-primary { box-shadow: 0 4px 14px rgba(47, 111, 191, 0.3); }
+.ep-day .ep-modal-close { background: rgba(255, 255, 255, 0.65); color: #1c2733; border-color: rgba(28, 39, 51, 0.25); }
+.ep-modal-overlay, .ep-modal, .ep-modal-close { transition: background-color .6s ease, border-color .6s ease, color .6s ease; }
+.ep-modal .ep-card, .ep-modal .ep-chips span, .ep-modal h1, .ep-modal .ep-h2, .ep-modal h3,
+.ep-modal .ep-lede, .ep-modal .ep-body, .ep-modal .ep-sub, .ep-modal .ep-way, .ep-modal .ep-eyebrow {
+  transition: background-color .6s ease, color .6s ease, border-color .6s ease; }
+.ep-modal .ep-btn { transition: transform .12s, box-shadow .12s,
+  background-color .6s ease, color .6s ease, border-color .6s ease; }
 
 @keyframes ep-overlay-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes ep-overlay-out { from { opacity: 1; } to { opacity: 0; } }
@@ -1249,8 +1535,7 @@ h3 { font-family: var(--display); font-size: 1.1rem; font-weight: 600; margin: 0
   .ep-brand { top: 1.2rem; left: 1.2rem; }
   .ep-legend { left: 1.2rem; bottom: 4.4rem; }
   .ep-hint { display: none; }
-  .ep-player { top: 1.2rem; right: 1.2rem; }
-  .ep-player-label { display: none; }
+  .ep-settings { top: 1.2rem; right: 1.2rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
